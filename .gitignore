@@ -1,0 +1,16 @@
+# Secrets — never commit
+.env
+
+# Per-service runtime config/state directories created by docker compose up
+jellyfin/
+gluetun/
+qbittorrent/
+prowlarr/
+sonarr/
+radarr/
+bazarr/
+jellyseerr/
+tailscale/
+
+# OS/editor cruft
+.DS_Store
