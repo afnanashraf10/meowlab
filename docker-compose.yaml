@@ -1,0 +1,310 @@
+# =============================================================================
+# meowlab-media-stack
+# -----------------------------------------------------------------------------
+# Self-hosted media stack: Jellyfin + *arr automation + VPN-routed torrenting
+# + reverse proxy (Traefik) + remote access (Tailscale / Cloudflare Tunnel).
+#
+# Requirements before running:
+#   1. Create the external Docker network used by Traefik:
+#        docker network create traefik
+#   2. Copy .env.example to .env and fill in real secrets (never commit .env).
+#   3. Ensure host directories referenced under `volumes:` exist
+#      (see README.md for the full list and expected layout).
+# =============================================================================
+
+services:
+
+  # ---------------------------------------------------------------------------
+  # Jellyfin — media server (movies/TV playback, transcoding, libraries).
+  # Exposed externally via Traefik at ${JELLYFIN_DOMAIN} (HTTP only, see .env).
+  # ---------------------------------------------------------------------------
+  jellyfin:
+    image: ghcr.io/linuxserver/jellyfin
+    container_name: jellyfin
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.jellyfin.rule=Host(`${JELLYFIN_DOMAIN}`)
+      - traefik.http.routers.jellyfin.entrypoints=web
+    environment:
+      - PUID=1000   # Host user ID that should own files written by the container
+      - PGID=1000   # Host group ID, same purpose as PUID
+    volumes:
+      - ./jellyfin:/config   # Jellyfin app config/db, persisted locally
+      - /media:/media        # Host media library root (read/write)
+    restart: unless-stopped
+    networks:
+      - traefik
+
+  # ---------------------------------------------------------------------------
+  # Gluetun — VPN gateway container (NordVPN via OpenVPN).
+  # qbittorrent and prowlarr attach to THIS container's network stack
+  # (network_mode: service:gluetun) so all their traffic is force-routed
+  # through the VPN tunnel. Ports for those two services are published here,
+  # not on their own service blocks.
+  # Docs: https://github.com/qdm12/gluetun-wiki/blob/main/setup/connect-a-container-to-gluetun.md#external-container-to-gluetun
+  # ---------------------------------------------------------------------------
+  gluetun:
+    image: qmcgaw/gluetun
+    container_name: gluetun
+    # container_name must stay uncommented so other containers (qbittorrent, prowlarr)
+    # can join this container's network stack via network_mode: service:gluetun.
+    cap_add:
+      - NET_ADMIN            # required for VPN tunnel interface management
+    devices:
+      - /dev/net/tun:/dev/net/tun   # required for OpenVPN/WireGuard tunnel device
+    ports:
+      - 8888:8888/tcp # Gluetun's built-in HTTP proxy
+      - 8388:8388/tcp # Gluetun's built-in Shadowsocks proxy (TCP)
+      - 8388:8388/udp # Shadowsocks proxy (UDP)
+      - 8080:8080     # qBittorrent WebUI (published here, not on qbittorrent service)
+      - 9696:9696     # Prowlarr WebUI (published here, not on prowlarr service)
+    volumes:
+      - ./gluetun:/gluetun   # Gluetun config, VPN state, server list cache
+    environment:
+      # Full provider/setup docs: https://github.com/qdm12/gluetun-wiki/tree/main/setup#setup
+      - PUID=1000
+      - PGID=1000
+      - VPN_SERVICE_PROVIDER=nordvpn
+      - VPN_TYPE=openvpn
+      # --- OpenVPN credentials (NordVPN "service credentials", not your login) ---
+      - OPENVPN_USER=${NORD_VPN_USERNAME}
+      - OPENVPN_PASSWORD=${NORD_VPN_PASSWORD}
+      - SERVER_COUNTRIES=Netherlands,Switzerland,Sweden,Germany
+      # --- WireGuard alternative (unused while VPN_TYPE=openvpn) ---
+      # - WIREGUARD_PRIVATE_KEY=your_wireguard_private_key_here
+      # - WIREGUARD_ADDRESSES=10.x.x.x/32
+      # Timezone used for accurate log timestamps (GST is not a valid IANA tz name,
+      # so Asia/Dubai is used instead)
+      - TZ=Asia/Dubai
+      # How often Gluetun refreshes its internal VPN server list
+      # Docs: https://github.com/qdm12/gluetun-wiki/blob/main/setup/servers.md#update-the-vpn-servers-list
+      - UPDATER_PERIOD=480h
+    restart: unless-stopped
+    networks:
+      - traefik
+
+  # ---------------------------------------------------------------------------
+  # qBittorrent — torrent client. Has NO network of its own; all traffic is
+  # routed through the gluetun container's VPN tunnel via network_mode.
+  # WebUI reachable on gluetun's published port 8080.
+  # ---------------------------------------------------------------------------
+  qbittorrent:
+    image: ghcr.io/linuxserver/qbittorrent
+    container_name: qbittorrent
+    depends_on:
+      - gluetun
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - WEBUI_PORT=8080
+    volumes:
+      - ./qbittorrent:/config             # qBittorrent app config
+      - /qbittorrent-downloads:/downloads # Shared download directory (also used by Sonarr/Radarr)
+    network_mode: service:gluetun   # routes all traffic through gluetun's VPN tunnel
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # Prowlarr — indexer manager, feeds indexers to Sonarr/Radarr.
+  # Also routed through gluetun's VPN tunnel for privacy when querying indexers.
+  # WebUI reachable on gluetun's published port 9696.
+  # ---------------------------------------------------------------------------
+  prowlarr:
+    image: lscr.io/linuxserver/prowlarr:develop
+    container_name: prowlarr
+    depends_on:
+      - gluetun
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - TZ=Asia/Dubai
+    volumes:
+      - ./prowlarr:/config   # Prowlarr app config, indexer definitions
+    network_mode: service:gluetun   # routes all traffic through gluetun's VPN tunnel
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # Sonarr — TV show search/download automation and library organization.
+  # ---------------------------------------------------------------------------
+  sonarr:
+    image: ghcr.io/linuxserver/sonarr
+    container_name: sonarr
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - TZ=Asia/Dubai
+    volumes:
+      - ./sonarr:/config                  # Sonarr app config/db
+      - /media/tv:/tv                     # TV library output
+      - /qbittorrent-downloads:/downloads # Must match qBittorrent's download path for imports to work
+    ports:
+      - 8989:8989   # Sonarr WebUI
+    restart: unless-stopped
+    networks:
+      - traefik
+
+  # ---------------------------------------------------------------------------
+  # Radarr — movie search/download automation and library organization.
+  # ---------------------------------------------------------------------------
+  radarr:
+    image: ghcr.io/linuxserver/radarr
+    container_name: radarr
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - TZ=Asia/Dubai
+    volumes:
+      - ./radarr:/config                  # Radarr app config/db
+      - /media/movies:/movies             # Movie library output
+      - /qbittorrent-downloads:/downloads # Must match qBittorrent's download path for imports to work
+    ports:
+      - 7878:7878   # Radarr WebUI
+    restart: unless-stopped
+    networks:
+      - traefik
+
+  # ---------------------------------------------------------------------------
+  # flaresolverr (disabled) — Cloudflare/anti-bot challenge solver.
+  # Superseded by "byparr" below, which serves the same purpose.
+  # Kept here, commented out, as a reference/fallback.
+  # ---------------------------------------------------------------------------
+  # flaresolverr:
+  #   image: ghcr.io/flaresolverr/flaresolverr:latest
+  #   container_name: flaresolverr
+  #   environment:
+  #     - LOG_LEVEL=debug
+  #     - TZ=Asia/Dubai
+  #   ports:
+  #     - 8191:8191
+  #   restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # Byparr — Cloudflare/anti-bot challenge solver used by Prowlarr indexers
+  # that require JS-challenge bypassing. Replaces flaresolverr above.
+  # ---------------------------------------------------------------------------
+  byparr:
+    image: ghcr.io/thephaseless/byparr:latest
+    container_name: byparr
+    environment:
+      - TZ=Asia/Dubai
+      - PORT=8191
+      - LOG_LEVEL=info
+    ports:
+      - 8191:8191
+    restart: unless-stopped
+    networks:
+      - traefik
+
+  # ---------------------------------------------------------------------------
+  # Jellyseerr — user-facing request portal; lets users request movies/shows
+  # which get forwarded to Sonarr/Radarr automatically.
+  # Exposed externally via Traefik at ${JELLYSEERR_DOMAIN} (HTTP only, see .env).
+  # ---------------------------------------------------------------------------
+  jellyseerr:
+    image: fallenbagel/jellyseerr:latest
+    container_name: jellyseerr
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.jellyseerr.rule=Host(`${JELLYSEERR_DOMAIN}`)
+      - traefik.http.routers.jellyseerr.entrypoints=web
+    environment:
+      - LOG_LEVEL=info
+      - TZ=Asia/Dubai
+    ports:
+      - 5055:5055   # Jellyseerr WebUI
+    volumes:
+      - ./jellyseerr:/app/config   # Jellyseerr app config/db
+    restart: unless-stopped
+    networks:
+      - traefik
+
+  # ---------------------------------------------------------------------------
+  # Tailscale — joins this host to a private Tailscale mesh network for
+  # secure remote access without exposing services publicly.
+  # Runs with network_mode: host, so it shares the host's network stack.
+  # ---------------------------------------------------------------------------
+  tailscale:
+    image: tailscale/tailscale:latest
+    container_name: tailscale
+    hostname: jellyfin-server
+    environment:
+      - TS_AUTHKEY=${TS_TOKEN}          # Tailscale auth key, generate a reusable/ephemeral key in the admin console
+      - TS_STATE_DIR=/var/lib/tailscale
+      - TS_USERSPACE=false              # false = use kernel networking (requires NET_ADMIN + /dev/net/tun)
+    volumes:
+      - ./tailscale/state:/var/lib/tailscale   # persisted Tailscale node identity/state
+      - /dev/net/tun:/dev/net/tun
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    network_mode: host
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # Bazarr — subtitle search/download automation for Sonarr/Radarr libraries.
+  # ---------------------------------------------------------------------------
+  bazarr:
+    image: lscr.io/linuxserver/bazarr:latest
+    container_name: bazarr
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - TZ=Asia/Dubai
+    volumes:
+      - ./bazarr:/config       # Bazarr app config/db
+      - /media/movies:/movies  # Must match Radarr's movie library path
+      - /media/tv:/tv          # Must match Sonarr's TV library path
+    ports:
+      - 6767:6767   # Bazarr WebUI
+    restart: unless-stopped
+    networks:
+      - traefik
+
+  # ---------------------------------------------------------------------------
+  # Cloudflared — runs a Cloudflare Tunnel, exposing Traefik-routed services
+  # to the internet without opening inbound ports on the host/router.
+  # ---------------------------------------------------------------------------
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    container_name: cloudflared
+    command: tunnel run
+    environment:
+      - TUNNEL_TOKEN=${CLOUDFLARE_TUNNEL_TOKEN}   # Token from your Cloudflare Zero Trust tunnel
+    restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"   # cap log file size to avoid unbounded disk growth
+        max-file: "3"     # keep at most 3 rotated log files
+    networks:
+      - traefik
+
+  # ---------------------------------------------------------------------------
+  # Traefik — reverse proxy that routes incoming requests to the correct
+  # container based on labels (see jellyfin/jellyseerr `traefik.http.routers.*`).
+  # Only an unencrypted "web" (port 80) entrypoint is defined; TLS is not
+  # configured here (rely on Cloudflare Tunnel / Tailscale for encryption
+  # in transit, or add a websecure entrypoint if exposing Traefik directly).
+  # ---------------------------------------------------------------------------
+  traefik:
+    container_name: traefik
+    image: traefik:3.6.1
+    restart: unless-stopped
+    command:
+      - --log.level=INFO
+      - --accesslog=true
+      - --providers.docker=true
+      - --providers.docker.exposedbydefault=false   # containers must opt in via traefik.enable=true
+      - --entryPoints.web.address=:80
+    ports:
+      - 8000:80   # host port 8000 -> Traefik's internal port 80 (web entrypoint)
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro   # read-only Docker socket access for service discovery
+    networks:
+      - traefik
+
+# =============================================================================
+# Networks
+# =============================================================================
+networks:
+  traefik:
+    external: true   # must be created beforehand: docker network create traefik
